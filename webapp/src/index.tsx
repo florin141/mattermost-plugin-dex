@@ -1,24 +1,12 @@
-// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See LICENSE.txt for license information.
+// Entry point for the Mattermost Dex SSO webapp plugin.
+// This file is bundled by webpack and loaded into the Mattermost frontend.
+// The DexLoginButton component is imported to register the login button.
+import './components/DexLoginButton';
 
-import manifest from 'manifest';
-import type {Store} from 'redux';
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+export interface PluginRegistry {}
 
-import type {GlobalState} from '@mattermost/types/store';
-
-import type {PluginRegistry} from 'types/mattermost-webapp';
-
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
 export default class Plugin {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars, @typescript-eslint/no-empty-function
-    public async initialize(registry: PluginRegistry, store: Store<GlobalState>) {
-        // @see https://developers.mattermost.com/extend/plugins/webapp/reference/
-    }
+    public async executePlugin(_registry: PluginRegistry): Promise<void> {}
 }
-
-declare global {
-    interface Window {
-        registerPlugin(pluginId: string, plugin: Plugin): void;
-    }
-}
-
-window.registerPlugin(manifest.id, new Plugin());

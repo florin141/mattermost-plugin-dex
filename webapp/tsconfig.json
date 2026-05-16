@@ -1,34 +1,19 @@
 {
   "compilerOptions": {
-    "target": "esnext",
-    "baseUrl": "./src",
-    "lib": [
-      "dom",
-      "dom.iterable",
-      "esnext"
-    ],
-    "allowJs": true,
-    "skipLibCheck": true,
-    "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true,
-    "strict": true,
-    "strictNullChecks": true,
-    "forceConsistentCasingInFileNames": true,
-    "module": "commonjs",
+    "target": "ES2018",
+    "lib": ["ES2018", "DOM"],
+    "jsx": "react-jsx",
+    "module": "ESNext",
     "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "experimentalDecorators": true,
-    "jsx": "react"
+    "declaration": false,
+    "outDir": "./dist",
+    "baseUrl": "./"
   },
-  "include": [
-    "src",
-    "tests"
-  ],
-  "exclude": [
-    "dist",
-    "node_modules",
-    "!node_modules/@types"
-  ]
+  "include": ["./src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }

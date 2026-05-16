@@ -4,8 +4,8 @@
     "description": "Authenticate users via Dex IdP (OIDC/OAuth2)",
     "homepage_url": "https://github.com/mattermost/mattermost-plugin-dex",
     "support_url": "https://github.com/mattermost/mattermost-plugin-dex/issues",
-    "icon_path": "assets/starter-template-icon.svg",
-    "min_server_version": "6.2.1",
+    "icon_path": "assets/dex-icon.svg",
+    "min_server_version": "10.0.0",
     "server": {
         "executables": {
             "linux-amd64": "server/dist/plugin-linux-amd64",
@@ -19,8 +19,55 @@
         "bundle_path": "webapp/dist/main.js"
     },
     "settings_schema": {
-        "header": "",
-        "footer": "",
-        "settings": []
+        "settings": [
+            {
+                "key": "IssuerURL",
+                "display_name": "Issuer URL",
+                "type": "text",
+                "help_text": "The Dex IdP issuer URL (e.g., https://dex.example.com)",
+                "placeholder": "https://dex.example.com"
+            },
+            {
+                "key": "ClientID",
+                "display_name": "Client ID",
+                "type": "text",
+                "help_text": "The OAuth2 client ID registered in Dex",
+                "placeholder": "mattermost"
+            },
+            {
+                "key": "ClientSecret",
+                "display_name": "Client Secret",
+                "type": "text",
+                "help_text": "The OAuth2 client secret registered in Dex",
+                "placeholder": "secret",
+                "secret": true
+            },
+            {
+                "key": "RedirectURL",
+                "display_name": "Redirect URL",
+                "type": "text",
+                "help_text": "The callback URL (usually auto-filled by Mattermost)"
+            },
+            {
+                "key": "ButtonLabel",
+                "display_name": "Button Label",
+                "type": "text",
+                "help_text": "Label displayed on the Dex SSO login button",
+                "default": "Sign in with Dex"
+            },
+            {
+                "key": "ButtonColor",
+                "display_name": "Button Color",
+                "type": "dropdown",
+                "help_text": "Color theme for the login button",
+                "default": "#009EDB",
+                "options": [
+                    {"display_name": "Blue", "value": "#009EDB"},
+                    {"display_name": "Green", "value": "#28a745"},
+                    {"display_name": "Purple", "value": "#6f42c1"},
+                    {"display_name": "Red", "value": "#dc3545"}
+                ]
+            }
+        ]
     }
 }

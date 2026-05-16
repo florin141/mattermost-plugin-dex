@@ -1,9 +1,9 @@
 {
-    "id": "com.mattermost.plugin-starter-template",
-    "name": "Plugin Starter Template",
-    "description": "This plugin serves as a starting point for writing a Mattermost plugin.",
-    "homepage_url": "https://github.com/mattermost/mattermost-plugin-starter-template",
-    "support_url": "https://github.com/mattermost/mattermost-plugin-starter-template/issues",
+    "id": "com.mattermost.dex",
+    "name": "Dex SSO Plugin",
+    "description": "Authenticate users via Dex IdP (OIDC/OAuth2)",
+    "homepage_url": "https://github.com/mattermost/mattermost-plugin-dex",
+    "support_url": "https://github.com/mattermost/mattermost-plugin-dex/issues",
     "icon_path": "assets/starter-template-icon.svg",
     "min_server_version": "6.2.1",
     "server": {

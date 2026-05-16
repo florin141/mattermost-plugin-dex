@@ -1,61 +1,32 @@
-# Plugin Starter Template
+# Dex SSO Plugin
 
-[![Build Status](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/ci.yml/badge.svg)](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/ci.yml)
-[![E2E Status](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/e2e.yml/badge.svg)](https://github.com/mattermost/mattermost-plugin-starter-template/actions/workflows/e2e.yml)
+[![Build Status](https://github.com/mattermost/mattermost-plugin-dex/actions/workflows/ci.yml/badge.svg)](https://github.com/mattermost/mattermost-plugin-dex/actions/workflows/ci.yml)
 
-This plugin serves as a starting point for writing a Mattermost plugin. Feel free to base your own plugin off this repository.
+This plugin allows Mattermost users to authenticate via Dex IdP using OIDC/OAuth2.
 
 To learn more about plugins, see [our plugin documentation](https://developers.mattermost.com/extend/plugins/).
 
-This template requires node v16 and npm v8. You can download and install nvm to manage your node versions by following the instructions [here](https://github.com/nvm-sh/nvm). Once you've setup the project simply run `nvm i` within the root folder to use the suggested version of node.
+This plugin requires node v24. You can download and install nvm to manage your node versions by following the instructions [here](https://github.com/nvm-sh/nvm). Once you've setup the project simply run `nvm i` within the root folder to use the suggested version of node.
 
 ## Getting Started
-Use GitHub's template feature to make a copy of this repository by clicking the "Use this template" button.
 
-Alternatively shallow clone the repository matching your plugin name:
-```
-git clone --depth 1 https://github.com/mattermost/mattermost-plugin-starter-template com.example.my-plugin
+To get started with this plugin, clone the repository:
+
+```bash
+git clone https://github.com/mattermost/mattermost-plugin-dex
 ```
 
 Note that this project uses [Go modules](https://github.com/golang/go/wiki/Modules). Be sure to locate the project outside of `$GOPATH`.
 
-Edit the following files:
-1. `plugin.json` with your `id`, `name`, and `description`:
-```json
-{
-    "id": "com.example.my-plugin",
-    "name": "My Plugin",
-    "description": "A plugin to enhance Mattermost."
-}
-```
-
-2. `go.mod` with your Go module path, following the `<hosting-site>/<repository>/<module>` convention:
-```
-module github.com/example/my-plugin
-```
-
-3. Replace all occurrences of `github.com/mattermost/mattermost-plugin-starter-template` in the codebase with your Go module path:
+Build your plugin:
 ```bash
-sed -i '' 's|github.com/mattermost/mattermost-plugin-starter-template|github.com/example/my-plugin|g' server/*.go
-```
-
-4. Replace `.golangci.yml` `local-prefixes` attribute with your Go module path:
-```yml
-linters-settings:
-  # [...]
-  goimports:
-    local-prefixes: github.com/example/my-plugin
-```
-
-5. Build your plugin:
-```
 make
 ```
 
 This will produce a single plugin file (with support for multiple architectures) for upload to your Mattermost server:
 
 ```
-dist/com.example.my-plugin.tar.gz
+dist/com.mattermost.dex.tar.gz
 ```
 
 ## Development
@@ -79,21 +50,21 @@ To avoid having to manually install your plugin, build and deploy your plugin us
 
 4. New package for upstream integration: a discrete client package for interfacing with a 3rd party is often a great place to break out into a new package
 
-### Modifying the server boilerplate
+### Server Architecture
 
-The server code comes with some boilerplate for creating an api, using slash commands, accessing the kvstore and using the cluster package for jobs.
+The server code is structured to provide an API, slash commands, and persistent storage via the KVStore.
 
-#### Api
+#### API
 
-api.go implements the ServeHTTP hook which allows the plugin to implement the http.Handler interface. Requests destined for the `/plugins/{id}` path will be routed to the plugin. This file also contains a sample `HelloWorld` endpoint that is tested in plugin_test.go.
+`api.go` implements the `ServeHTTP` hook, which allows the plugin to implement the `http.Handler` interface. Requests destined for the `/plugins/com.mattermost.dex` path will be routed to the plugin. This file also contains a sample `HelloWorld` endpoint that is tested in `plugin_test.go`.
 
 #### Command package
 
-This package contains the boilerplate for adding a slash command and an instance of it is created in the `OnActivate` hook in plugin.go. If you don't need it you can delete the package and remove any reference to `commandClient` in plugin.go. The package also contains an example of how to create a mock for testing.
+The `server/command` package handles slash commands. It is initialized in the `OnActivate` hook in `plugin.go`.
 
 #### KVStore package
 
-This is a central place for you to access the KVStore methods that are available in the `pluginapi.Client`. The package contains an interface for you to define your methods that will wrap the KVStore methods. An instance of the KVStore is created in the `OnActivate` hook.
+The `server/store/kvstore` package provides a central place for accessing the KVStore methods available in the `pluginapi.Client`. It uses an interface to wrap KVStore methods for easier testing and usage. An instance of the KVStore is created in the `OnActivate` hook.
 
 ### Deploying with Local Mode
 

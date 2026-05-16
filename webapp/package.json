@@ -6,7 +6,8 @@
     "build": "webpack --mode production",
     "dev": "webpack --mode development --watch",
     "lint": "",
-    "test": ""
+    "test": "",
+    "check-types": "tsc"
   },
   "dependencies": {
     "react": "^18.2.0",

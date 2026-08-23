@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,7 +18,13 @@ import (
 	"github.com/mattermost/mattermost/server/public/plugin"
 )
 
-const cookieSessionTokenKey = "MMAUTHTOKEN"
+const (
+	pluginID              = "com.mattermost.dex"
+	cookieSessionTokenKey = "MMAUTHTOKEN"
+	cookieStateKey        = "dex_oauth_state"
+	stateCookieMaxAge     = 600 // 10 minutes
+	sessionTTL            = 30 * 24 * time.Hour
+)
 
 // pluginConfig holds the settings from plugin.json.
 type pluginConfig struct {
@@ -25,6 +34,15 @@ type pluginConfig struct {
 	ButtonLabel  string `json:"ButtonLabel"`
 	ButtonColor  string `json:"ButtonColor"`
 	RedirectURL  string `json:"RedirectURL"`
+}
+
+// publicConfigResponse is the camelCase DTO returned to the webapp.
+type publicConfigResponse struct {
+	IssuerURL   string `json:"issuerUrl"`
+	ClientID    string `json:"clientId"`
+	ButtonLabel string `json:"buttonLabel"`
+	ButtonColor string `json:"buttonColor"`
+	RedirectURL string `json:"redirectUrl"`
 }
 
 // claims holds OIDC ID token claims.
@@ -41,6 +59,8 @@ type claims struct {
 type Plugin struct {
 	plugin.MattermostPlugin // embedded for API access
 
+	api api // seam for testability; set to p.API in OnActivate
+
 	config pluginConfig
 
 	mu       sync.Mutex
@@ -50,7 +70,15 @@ type Plugin struct {
 
 // OnConfigurationChange is called when the plugin config changes.
 func (p *Plugin) OnConfigurationChange() error {
-	p.config = pluginConfig{
+	if p.api == nil {
+		p.api = p.API
+	}
+
+	// Populate a local config first, then publish it under the lock so that
+	// p.config is only ever written while holding p.mu (M-1: no data race vs
+	// the lock-protected read in GetPluginPublicConfig).
+	var cfg pluginConfig
+	cfg = pluginConfig{
 		IssuerURL:    "https://dex.example.com",
 		ClientID:     "mattermost",
 		ClientSecret: "secret",
@@ -58,42 +86,45 @@ func (p *Plugin) OnConfigurationChange() error {
 		ButtonColor:  "#009EDB",
 	}
 
-	if err := p.API.LoadPluginConfiguration(&p.config); err != nil {
+	if err := p.api.LoadPluginConfiguration(&cfg); err != nil {
 		return fmt.Errorf("failed to load plugin config: %w", err)
 	}
 
 	// Auto-detect redirect URL if not set
-	if p.config.RedirectURL == "" {
-		siteURL := p.getSiteURL()
-		if siteURL != "" {
-			p.config.RedirectURL = fmt.Sprintf("%s/plugins/com.example.dex-sso/callback", siteURL)
+	if cfg.RedirectURL == "" {
+		if siteURL := p.getSiteURL(); siteURL != "" {
+			cfg.RedirectURL = fmt.Sprintf("%s/plugins/%s/callback", siteURL, pluginID)
 		}
 	}
 
+	p.mu.Lock()
+	p.config = cfg
+	p.mu.Unlock()
+
 	// Re-initialize OIDC provider
-	if p.config.IssuerURL == "" || p.config.ClientID == "" || p.config.ClientSecret == "" {
+	if cfg.IssuerURL == "" || cfg.ClientID == "" || cfg.ClientSecret == "" {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	provider, err := oidc.NewProvider(ctx, p.config.IssuerURL)
+	provider, err := oidc.NewProvider(ctx, cfg.IssuerURL)
 	if err != nil {
-		p.API.LogWarn("failed to create OIDC provider", "issuer", p.config.IssuerURL, "error", err.Error())
+		p.api.LogWarn("failed to create OIDC provider", "issuer", cfg.IssuerURL, "error", err.Error())
 		return nil
 	}
 
 	p.mu.Lock()
 	p.provider = &oauth2.Config{
-		ClientID:     p.config.ClientID,
-		ClientSecret: p.config.ClientSecret,
-		RedirectURL:  p.config.RedirectURL,
+		ClientID:     cfg.ClientID,
+		ClientSecret: cfg.ClientSecret,
+		RedirectURL:  cfg.RedirectURL,
 		Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 		Endpoint:     provider.Endpoint(),
 	}
 	p.verifier = provider.Verifier(&oidc.Config{
-		ClientID: p.config.ClientID,
+		ClientID: cfg.ClientID,
 	})
 	p.mu.Unlock()
 
@@ -102,16 +133,20 @@ func (p *Plugin) OnConfigurationChange() error {
 
 // OnActivate is called when the plugin is activated.
 func (p *Plugin) OnActivate() error {
+	if p.api == nil {
+		p.api = p.API
+	}
+
 	siteURL := p.getSiteURL()
 	if siteURL == "" {
-		p.API.LogWarn("site URL is empty, plugin will operate with defaults")
+		p.api.LogWarn("site URL is empty, plugin will operate with defaults")
 	}
 	return p.OnConfigurationChange()
 }
 
 // getSiteURL returns the Mattermost site URL.
 func (p *Plugin) getSiteURL() string {
-	cfg := p.API.GetConfig()
+	cfg := p.api.GetConfig()
 	if cfg == nil {
 		return ""
 	}
@@ -121,11 +156,25 @@ func (p *Plugin) getSiteURL() string {
 	return *cfg.ServiceSettings.SiteURL
 }
 
+// isHTTPS returns true when the server is configured for HTTPS.
+func (p *Plugin) isHTTPS() bool {
+	cfg := p.api.GetConfig()
+	if cfg == nil {
+		return true
+	}
+	if cfg.ServiceSettings.ConnectionSecurity == nil {
+		return true
+	}
+	return *cfg.ServiceSettings.ConnectionSecurity != "http"
+}
+
 // ServeHTTP handles HTTP requests for the plugin's API endpoints.
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
 	switch path {
+	case "/login":
+		p.handleLogin(w, r)
 	case "/api/public-config":
 		p.GetPluginPublicConfig(w, r)
 	case "/callback":
@@ -133,6 +182,47 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleLogin initiates the OAuth flow: generates state, sets the state
+// cookie, and redirects to the IdP's authorization endpoint.
+func (p *Plugin) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p.mu.Lock()
+	conf := p.provider
+	p.mu.Unlock()
+
+	if conf == nil {
+		http.Redirect(w, r, "/login?error=config_error", http.StatusFound)
+		return
+	}
+
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		p.api.LogError("failed to generate state", "error", err.Error())
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	state := hex.EncodeToString(stateBytes)
+
+	cookie := &http.Cookie{
+		Name:     cookieStateKey,
+		Value:    state,
+		Path:     "/plugins/" + pluginID,
+		MaxAge:   stateCookieMaxAge,
+		HttpOnly: true,
+		Secure:   p.isHTTPS(),
+		// Lax (not Strict) so the IdP->/callback cross-site top-level GET still carries the state cookie.
+		SameSite: http.SameSiteLaxMode,
+	}
+	http.SetCookie(w, cookie)
+
+	authURL := conf.AuthCodeURL(state)
+	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 // GetPluginPublicConfig returns the public OIDC configuration for the webapp.
@@ -147,17 +237,17 @@ func (p *Plugin) GetPluginPublicConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.mu.Lock()
-	resp := map[string]string{
-		"IssuerURL":   p.config.IssuerURL,
-		"ClientId":    p.config.ClientID,
-		"ButtonLabel": p.config.ButtonLabel,
-		"ButtonColor": p.config.ButtonColor,
-		"RedirectURL": p.config.RedirectURL,
+	resp := publicConfigResponse{
+		IssuerURL:   p.config.IssuerURL,
+		ClientID:    p.config.ClientID,
+		ButtonLabel: p.config.ButtonLabel,
+		ButtonColor: p.config.ButtonColor,
+		RedirectURL: p.config.RedirectURL,
 	}
 	p.mu.Unlock()
 
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		p.API.LogError("failed to encode public config response", "error", err.Error())
+		p.api.LogError("failed to encode public config response", "error", err.Error())
 	}
 }
 
@@ -168,27 +258,27 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Validate OAuth2 state parameter
 	state := r.URL.Query().Get("state")
 	if state == "" {
-		p.API.LogWarn("callback missing state parameter", "ip", r.RemoteAddr)
+		p.api.LogWarn("callback missing state parameter", "ip", r.RemoteAddr)
 		http.Redirect(w, r, "/login?error=invalid_request", http.StatusFound)
 		return
 	}
 
 	// Verify state matches the stored cookie
-	storedState, err := r.Cookie("dex_oauth_state")
-	if err != nil || storedState.Value != state {
-		p.API.LogWarn("oauth state mismatch", "ip", r.RemoteAddr)
+	storedState, err := r.Cookie(cookieStateKey)
+	if err != nil || subtle.ConstantTimeCompare([]byte(storedState.Value), []byte(state)) != 1 {
+		p.api.LogWarn("oauth state mismatch", "ip", r.RemoteAddr)
 		http.Redirect(w, r, "/login?error=invalid_state", http.StatusFound)
 		return
 	}
 
 	// Delete the state cookie
 	http.SetCookie(w, &http.Cookie{
-		Name:     "dex_oauth_state",
+		Name:     cookieStateKey,
 		Value:    "",
-		Path:     "/",
+		Path:     "/plugins/" + pluginID,
 		MaxAge:   -1,
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode,
 	})
 
 	// Exchange code for tokens
@@ -200,6 +290,7 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	p.mu.Lock()
 	conf := p.provider
+	verifier := p.verifier
 	p.mu.Unlock()
 
 	if conf == nil {
@@ -209,7 +300,7 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	token, err := conf.Exchange(ctx, code)
 	if err != nil {
-		p.API.LogError("token exchange failed", "error", err.Error())
+		p.api.LogError("token exchange failed", "error", err.Error())
 		http.Redirect(w, r, "/login?error=token_exchange_failed", http.StatusFound)
 		return
 	}
@@ -217,16 +308,12 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Extract ID token
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok || rawIDToken == "" {
-		p.API.LogWarn("no id_token in token response", "ip", r.RemoteAddr)
+		p.api.LogWarn("no id_token in token response", "ip", r.RemoteAddr)
 		http.Redirect(w, r, "/login?error=no_id_token", http.StatusFound)
 		return
 	}
 
 	// Verify the ID token
-	p.mu.Lock()
-	verifier := p.verifier
-	p.mu.Unlock()
-
 	if verifier == nil {
 		http.Redirect(w, r, "/login?error=config_error", http.StatusFound)
 		return
@@ -234,7 +321,7 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		p.API.LogError("id token verification failed", "error", err.Error())
+		p.api.LogError("id token verification failed", "error", err.Error())
 		http.Redirect(w, r, "/login?error=invalid_token", http.StatusFound)
 		return
 	}
@@ -242,7 +329,7 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Parse claims
 	var c claims
 	if err := idToken.Claims(&c); err != nil {
-		p.API.LogError("failed to parse id token claims", "error", err.Error())
+		p.api.LogError("failed to parse id token claims", "error", err.Error())
 		http.Redirect(w, r, "/login?error=invalid_claims", http.StatusFound)
 		return
 	}
@@ -250,45 +337,38 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 	// Get or create the user
 	user, err := p.getOrCreateUser(c)
 	if err != nil {
-		p.API.LogError("user lookup or creation failed", "error", err.Error())
+		p.api.LogError("user lookup or creation failed", "error", err.Error())
 		http.Redirect(w, r, "/login?error=user_error", http.StatusFound)
 		return
 	}
 
 	// Create session
 	session := &model.Session{
-		UserId:      user.Id,
-		Roles:       user.Roles,
-		IsOAuth:     true,
+		UserId:         user.Id,
+		Roles:          user.Roles,
+		IsOAuth:        true,
 		LastActivityAt: time.Now().Unix(),
-		CreateAt:     time.Now().Unix(),
-		ExpiresAt:    time.Now().Add(30 * 24 * time.Hour).Unix(),
+		CreateAt:       time.Now().Unix(),
+		ExpiresAt:      time.Now().Add(sessionTTL).Unix(),
 	}
 
-	createdSession, appErr := p.API.CreateSession(session)
+	createdSession, appErr := p.api.CreateSession(session)
 	if appErr != nil {
-		p.API.LogError("session creation failed", "error", appErr.Error())
+		p.api.LogError("session creation failed", "error", appErr.Error())
 		http.Redirect(w, r, "/login?error=session_error", http.StatusFound)
 		return
 	}
 
 	// Set the authentication cookie
-	isSecure := true
-	if siteCfg := p.API.GetConfig(); siteCfg != nil {
-		if siteCfg.ServiceSettings.ConnectionSecurity != nil && *siteCfg.ServiceSettings.ConnectionSecurity == "http" {
-			isSecure = false
-		}
-	}
-
 	cookie := &http.Cookie{
 		Name:     cookieSessionTokenKey,
 		Value:    createdSession.Token,
 		Path:     "/",
 		Domain:   "",
-		Expires:  time.Now().Add(30 * 24 * time.Hour),
+		Expires:  time.Now().Add(sessionTTL),
 		HttpOnly: true,
-		Secure:   isSecure,
-		SameSite: http.SameSiteStrictMode,
+		Secure:   p.isHTTPS(),
+		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, cookie)
 
@@ -303,7 +383,7 @@ func (p *Plugin) getOrCreateUser(c claims) (*model.User, error) {
 		return nil, fmt.Errorf("no email in claims")
 	}
 
-	user, appErr := p.API.GetUserByEmail(email)
+	user, appErr := p.api.GetUserByEmail(email)
 	if appErr != nil {
 		return p.createUser(email, c)
 	}
@@ -318,7 +398,7 @@ func (p *Plugin) createUser(email string, c claims) (*model.User, error) {
 		baseUsername = model.NewRandomString(16)
 	}
 
-	// Handle username collisions (PLAN.md 2.3)
+	// Handle username collisions
 	var username string
 	for i := 0; i < 5; i++ {
 		if i > 0 {
@@ -326,7 +406,7 @@ func (p *Plugin) createUser(email string, c claims) (*model.User, error) {
 		} else {
 			username = baseUsername
 		}
-		_, appErr := p.API.GetUserByUsername(username)
+		_, appErr := p.api.GetUserByUsername(username)
 		if appErr != nil {
 			break // username is free
 		}
@@ -345,13 +425,14 @@ func (p *Plugin) createUser(email string, c claims) (*model.User, error) {
 		Password:      model.NewRandomString(32),
 	}
 
-	if _, appErr := p.API.CreateUser(user); appErr != nil {
+	created, appErr := p.api.CreateUser(user)
+	if appErr != nil {
 		return nil, fmt.Errorf("failed to create user: %w", appErr)
 	}
 
-	p.API.LogInfo("new user created via Dex SSO", "username", user.Username, "email", user.Email)
+	p.api.LogInfo("new user created via Dex SSO", "user_id", created.Id)
 
-	return user, nil
+	return created, nil
 }
 
 // generateUsername creates a username from a preferred name.

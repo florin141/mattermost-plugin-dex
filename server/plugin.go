@@ -180,13 +180,15 @@ func (p *Plugin) getSiteURL() string {
 }
 
 // isHTTPS returns true when the server is configured for HTTPS.
+// A nil config fails secure; Mattermost treats a nil or empty
+// ConnectionSecurity as plain HTTP.
 func (p *Plugin) isHTTPS() bool {
 	cfg := p.api.GetConfig()
 	if cfg == nil {
 		return true
 	}
-	if cfg.ServiceSettings.ConnectionSecurity == nil {
-		return true
+	if cfg.ServiceSettings.ConnectionSecurity == nil || *cfg.ServiceSettings.ConnectionSecurity == "" {
+		return false
 	}
 	return *cfg.ServiceSettings.ConnectionSecurity != "http"
 }
@@ -365,14 +367,15 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create session
+	// Create the session the same way Mattermost's built-in OAuth providers
+	// do: only UserId and IsOAuth. Do NOT set Roles or any time fields -
+	// model.Session times are Unix *milliseconds*, while time.Now().Unix()
+	// returns *seconds*, so a second-based ExpiresAt looks expired at
+	// creation and the first request after login bounces to /login with 401.
+	// The server fills in Roles, CreateAt, LastActivityAt and ExpiresAt.
 	session := &model.Session{
-		UserId:         user.Id,
-		Roles:          user.Roles,
-		IsOAuth:        true,
-		LastActivityAt: time.Now().Unix(),
-		CreateAt:       time.Now().Unix(),
-		ExpiresAt:      time.Now().Add(sessionTTL).Unix(),
+		UserId:  user.Id,
+		IsOAuth: true,
 	}
 
 	createdSession, appErr := p.api.CreateSession(session)
@@ -417,6 +420,15 @@ func (p *Plugin) getOrCreateUser(c claims) (*model.User, error) {
 // createUser creates a new Mattermost user from OIDC claims.
 func (p *Plugin) createUser(email string, c claims) (*model.User, error) {
 	baseUsername := p.generateUsername(c.PreferredName)
+	if baseUsername == "" {
+		// Dex's LDAP connector emits no preferred_username; fall back to the
+		// local part of the email (aisha.okonkwo@example.com -> aisha.okonkwo).
+		local := email
+		if i := strings.LastIndex(email, "@"); i > 0 {
+			local = email[:i]
+		}
+		baseUsername = p.generateUsername(local)
+	}
 	if baseUsername == "" {
 		baseUsername = model.NewRandomString(16)
 	}
@@ -466,7 +478,7 @@ func (p *Plugin) generateUsername(preferredName string) string {
 
 	name := strings.ToLower(preferredName)
 	name = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
 			return r
 		}
 		return -1
@@ -476,7 +488,7 @@ func (p *Plugin) generateUsername(preferredName string) string {
 	var sb strings.Builder
 	var lastSpecial bool
 	for _, r := range name {
-		if r == '-' || r == '_' {
+		if r == '-' || r == '_' || r == '.' {
 			if !lastSpecial {
 				sb.WriteRune(r)
 				lastSpecial = true
@@ -488,7 +500,7 @@ func (p *Plugin) generateUsername(preferredName string) string {
 	}
 	name = sb.String()
 
-	name = strings.Trim(name, "-_")
+	name = strings.Trim(name, "-_.")
 	if len(name) < 1 {
 		return ""
 	}

@@ -139,6 +139,12 @@ func TestGenerateUsername(t *testing.T) {
 		{"---leading", "leading"},
 		{"trailing---", "trailing"},
 		{"_under_score", "under_score"},
+		{"aisha.okonkwo", "aisha.okonkwo"},
+		{"John.Doe", "john.doe"},
+		{"a..b", "a.b"},
+		{".a.b.", "a.b"},
+		{"-._a", "a"},
+		{"...", ""},
 		{"", ""},
 		{"a", "a"},
 		{strings.Repeat("a", 70), strings.Repeat("a", 70)},
@@ -188,6 +194,112 @@ func TestCleanUsernameStartsWithLetter(t *testing.T) {
 			continue
 		}
 		t.Errorf("cleaned username %q does not start with a letter", cleaned)
+	}
+}
+
+func TestCreateUser_Username(t *testing.T) {
+	tests := []struct {
+		name          string
+		email         string
+		preferredName string
+		taken         []string // pre-existing usernames to simulate collisions
+		validate      func(t *testing.T, username string)
+	}{
+		{
+			name:          "preferred_username_with_dots_preserved",
+			email:         "aisha.okonkwo@example.com",
+			preferredName: "aisha.okonkwo",
+			validate: func(t *testing.T, username string) {
+				if username != "aisha.okonkwo" {
+					t.Errorf("username = %q, want %q", username, "aisha.okonkwo")
+				}
+			},
+		},
+		{
+			name:          "no_preferred_username_uses_email_local_part",
+			email:         "aisha.okonkwo@example.com",
+			preferredName: "",
+			validate: func(t *testing.T, username string) {
+				if username != "aisha.okonkwo" {
+					t.Errorf("username = %q, want %q", username, "aisha.okonkwo")
+				}
+			},
+		},
+		{
+			name:          "all_stripped_falls_back_to_random",
+			email:         "!!!@example.com",
+			preferredName: "...",
+			validate: func(t *testing.T, username string) {
+				// Preferred name and email local part both strip to nothing,
+				// so a 16-char random base is expected (possibly with a "u"
+				// prefix added by cleanUsername when it starts with a digit).
+				if len(username) < 16 {
+					t.Errorf("username = %q, want a 16-char random fallback", username)
+				}
+			},
+		},
+		{
+			name:          "collision_appends_counter",
+			email:         "base@example.com",
+			preferredName: "base",
+			taken:         []string{"base"},
+			validate: func(t *testing.T, username string) {
+				if username != "base1" {
+					t.Errorf("username = %q, want %q", username, "base1")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockAPI()
+			for _, u := range tc.taken {
+				mock.usersByUsername[u] = &model.User{Id: model.NewId(), Username: u}
+			}
+			p := &Plugin{api: mock}
+
+			user, err := p.createUser(tc.email, claims{Email: tc.email, PreferredName: tc.preferredName})
+			if err != nil {
+				t.Fatalf("createUser failed: %v", err)
+			}
+			tc.validate(t, user.Username)
+		})
+	}
+}
+
+func TestIsHTTPS(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *model.Config
+		want bool
+	}{
+		{"nil config fails secure", nil, true},
+		{"nil connection security is plain http", configWithConnectionSecurity(nil), false},
+		{"empty connection security is plain http", configWithConnectionSecurity(model.NewPointer("")), false},
+		{"http is plain http", configWithConnectionSecurity(model.NewPointer("http")), false},
+		{"tls is https", configWithConnectionSecurity(model.NewPointer("tls")), true},
+		{"strict is https", configWithConnectionSecurity(model.NewPointer("strict")), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockAPI()
+			mock.config = tc.cfg
+			p := &Plugin{api: mock}
+			if got := p.isHTTPS(); got != tc.want {
+				t.Errorf("isHTTPS() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func configWithConnectionSecurity(cs *string) *model.Config {
+	return &model.Config{
+		ServiceSettings: model.ServiceSettings{
+			SiteURL:            model.NewPointer("http://localhost:8065"),
+			ConnectionSecurity: cs,
+		},
 	}
 }
 
@@ -785,6 +897,20 @@ func TestHandleCallback(t *testing.T) {
 		if mock.createdSession.Token == "" {
 			t.Error("expected session token to be set")
 		}
+		if !mock.createdSession.IsOAuth {
+			t.Error("expected IsOAuth=true on created session")
+		}
+		// The server owns the time fields: the plugin must not set them
+		// (seconds vs milliseconds would mark the session expired at creation).
+		if mock.createdSession.CreateAt != 0 {
+			t.Errorf("session.CreateAt = %d, want 0 (server owns the field)", mock.createdSession.CreateAt)
+		}
+		if mock.createdSession.LastActivityAt != 0 {
+			t.Errorf("session.LastActivityAt = %d, want 0 (server owns the field)", mock.createdSession.LastActivityAt)
+		}
+		if mock.createdSession.ExpiresAt != 0 {
+			t.Errorf("session.ExpiresAt = %d, want 0 (server owns the field)", mock.createdSession.ExpiresAt)
+		}
 
 		// Verify MMAUTHTOKEN cookie was set
 		cookies := w.Result().Cookies()
@@ -872,6 +998,13 @@ func TestHandleCallback(t *testing.T) {
 		}
 		if mock.createdSession.UserId != existingUser.Id {
 			t.Errorf("session.UserId = %q, want %q", mock.createdSession.UserId, existingUser.Id)
+		}
+		if !mock.createdSession.IsOAuth {
+			t.Error("expected IsOAuth=true on created session")
+		}
+		if mock.createdSession.CreateAt != 0 || mock.createdSession.LastActivityAt != 0 || mock.createdSession.ExpiresAt != 0 {
+			t.Errorf("session time fields must be left to the server, got CreateAt=%d LastActivityAt=%d ExpiresAt=%d",
+				mock.createdSession.CreateAt, mock.createdSession.LastActivityAt, mock.createdSession.ExpiresAt)
 		}
 	})
 

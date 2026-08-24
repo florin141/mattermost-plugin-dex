@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/oauth2"
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/mattermost/mattermost/server/public/plugin"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -74,20 +74,22 @@ func (p *Plugin) OnConfigurationChange() error {
 		p.api = p.API
 	}
 
-	// Populate a local config first, then publish it under the lock so that
-	// p.config is only ever written while holding p.mu (M-1: no data race vs
-	// the lock-protected read in GetPluginPublicConfig).
+	// Load the saved configuration. Zero values are load-bearing: they mark
+	// an unconfigured plugin. Do not pre-populate credential placeholders,
+	// otherwise an unconfigured plugin would attempt OIDC discovery against
+	// a bogus issuer instead of surfacing a config error.
 	var cfg pluginConfig
-	cfg = pluginConfig{
-		IssuerURL:    "https://dex.example.com",
-		ClientID:     "mattermost",
-		ClientSecret: "secret",
-		ButtonLabel:  "Sign in with Dex",
-		ButtonColor:  "#009EDB",
-	}
-
 	if err := p.api.LoadPluginConfiguration(&cfg); err != nil {
 		return fmt.Errorf("failed to load plugin config: %w", err)
+	}
+
+	// Default the cosmetic settings so the public config endpoint stays
+	// well-formed when the admin has not customized them.
+	if cfg.ButtonLabel == "" {
+		cfg.ButtonLabel = "Sign in with Dex"
+	}
+	if cfg.ButtonColor == "" {
+		cfg.ButtonColor = "#009EDB"
 	}
 
 	// Auto-detect redirect URL if not set
@@ -97,12 +99,31 @@ func (p *Plugin) OnConfigurationChange() error {
 		}
 	}
 
+	// The plugin is unconfigured until all OIDC credentials are present;
+	// until then p.provider stays nil and /login redirects to
+	// /login?error=config_error.
+	unconfigured := cfg.IssuerURL == "" || cfg.ClientID == "" || cfg.ClientSecret == ""
+
+	// Publish the config under the lock so that p.config, p.provider and
+	// p.verifier only ever change while holding p.mu (M-1: no data race vs
+	// the lock-protected reads). When unconfigured, clear any stale
+	// provider so a previously valid setup does not keep working after the
+	// credentials are removed.
 	p.mu.Lock()
+	prev := p.config
 	p.config = cfg
+	if unconfigured {
+		p.provider = nil
+		p.verifier = nil
+	}
 	p.mu.Unlock()
 
-	// Re-initialize OIDC provider
-	if cfg.IssuerURL == "" || cfg.ClientID == "" || cfg.ClientSecret == "" {
+	if unconfigured {
+		// Warn only when the config actually changed, so repeated saves of
+		// the same unconfigured settings do not spam the log.
+		if prev != cfg {
+			p.api.LogWarn("plugin unconfigured - no issuer URL or client credentials set; /login will redirect to config_error")
+		}
 		return nil
 	}
 
@@ -127,6 +148,8 @@ func (p *Plugin) OnConfigurationChange() error {
 		ClientID: cfg.ClientID,
 	})
 	p.mu.Unlock()
+
+	p.api.LogInfo("OIDC provider initialized", "issuer", cfg.IssuerURL)
 
 	return nil
 }

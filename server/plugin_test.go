@@ -16,6 +16,12 @@ import (
 
 // --- Mock API ---
 
+// logEntry records a single plugin log call for test assertions.
+type logEntry struct {
+	level string
+	msg   string
+}
+
 type mockAPI struct {
 	config           *model.Config
 	loadedConfig     *pluginConfig
@@ -25,6 +31,7 @@ type mockAPI struct {
 	createdSession   *model.Session
 	createUserErr    *model.AppError
 	createSessionErr *model.AppError
+	logs             []logEntry
 }
 
 func newMockAPI() *mockAPI {
@@ -51,11 +58,29 @@ func (m *mockAPI) GetConfig() *model.Config {
 	return m.config
 }
 
-func (m *mockAPI) LogInfo(message string, keyValuePairs ...interface{}) {}
+func (m *mockAPI) LogInfo(message string, keyValuePairs ...interface{}) {
+	m.logs = append(m.logs, logEntry{level: "info", msg: message})
+}
 
-func (m *mockAPI) LogWarn(message string, keyValuePairs ...interface{}) {}
+func (m *mockAPI) LogWarn(message string, keyValuePairs ...interface{}) {
+	m.logs = append(m.logs, logEntry{level: "warn", msg: message})
+}
 
-func (m *mockAPI) LogError(message string, keyValuePairs ...interface{}) {}
+func (m *mockAPI) LogError(message string, keyValuePairs ...interface{}) {
+	m.logs = append(m.logs, logEntry{level: "error", msg: message})
+}
+
+// countLogs returns how many recorded log entries with the given level have
+// a message containing the given substring.
+func (m *mockAPI) countLogs(level, substring string) int {
+	n := 0
+	for _, l := range m.logs {
+		if l.level == level && strings.Contains(l.msg, substring) {
+			n++
+		}
+	}
+	return n
+}
 
 func (m *mockAPI) GetUserByEmail(email string) (*model.User, *model.AppError) {
 	if u, ok := m.usersByEmail[email]; ok {
@@ -453,6 +478,119 @@ func TestOnConfigurationChange_RedirectURL(t *testing.T) {
 
 		if p.config.RedirectURL != "https://custom.example.com/dex/callback" {
 			t.Errorf("RedirectURL = %q, want explicit value preserved", p.config.RedirectURL)
+		}
+	})
+}
+
+func TestOnConfigurationChange_Unconfigured(t *testing.T) {
+	t.Run("no_credentials_provider_stays_nil", func(t *testing.T) {
+		mock := newMockAPI()
+		// loadedConfig is nil: the admin has not saved any settings
+		p := &Plugin{api: mock}
+		if err := p.OnConfigurationChange(); err != nil {
+			t.Fatalf("OnConfigurationChange failed: %v", err)
+		}
+
+		if p.provider != nil {
+			t.Error("expected provider to be nil when unconfigured")
+		}
+		if p.verifier != nil {
+			t.Error("expected verifier to be nil when unconfigured")
+		}
+
+		// Auto-fill of RedirectURL must still happen
+		if p.config.RedirectURL != "http://localhost:8065/plugins/com.mattermost.dex/callback" {
+			t.Errorf("RedirectURL = %q, want auto-filled value", p.config.RedirectURL)
+		}
+
+		// /login must surface the unconfigured state
+		req := httptest.NewRequest(http.MethodGet, "/plugins/com.mattermost.dex/login", nil)
+		w := httptest.NewRecorder()
+		p.handleLogin(w, req)
+		if w.Code != http.StatusFound {
+			t.Fatalf("expected 302, got %d", w.Code)
+		}
+		if loc := w.Header().Get("Location"); loc != "/login?error=config_error" {
+			t.Errorf("expected /login?error=config_error, got %q", loc)
+		}
+
+		// Public config must stay well-formed with the default button label
+		req = httptest.NewRequest(http.MethodGet, "/plugins/com.mattermost.dex/api/public-config", nil)
+		w = httptest.NewRecorder()
+		p.GetPluginPublicConfig(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+		var resp publicConfigResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+		if resp.ButtonLabel != "Sign in with Dex" {
+			t.Errorf("buttonLabel = %q, want default %q", resp.ButtonLabel, "Sign in with Dex")
+		}
+		if resp.IssuerURL != "" || resp.ClientID != "" {
+			t.Errorf("expected empty issuerUrl/clientId when unconfigured, got %q/%q", resp.IssuerURL, resp.ClientID)
+		}
+
+		// The unconfigured state is warned about exactly once...
+		if n := mock.countLogs("warn", "unconfigured"); n != 1 {
+			t.Errorf("expected exactly 1 unconfigured warning, got %d", n)
+		}
+
+		// ...and a repeated identical save must not re-log it
+		if err := p.OnConfigurationChange(); err != nil {
+			t.Fatalf("second OnConfigurationChange failed: %v", err)
+		}
+		if n := mock.countLogs("warn", "unconfigured"); n != 1 {
+			t.Errorf("expected still 1 unconfigured warning after identical re-save, got %d", n)
+		}
+	})
+
+	t.Run("partial_credentials_provider_stays_nil", func(t *testing.T) {
+		mock := newMockAPI()
+		mock.loadedConfig = &pluginConfig{
+			IssuerURL: "https://dex.example.com",
+			ClientID:  "mattermost",
+			// ClientSecret intentionally missing
+		}
+		p := &Plugin{api: mock}
+		if err := p.OnConfigurationChange(); err != nil {
+			t.Fatalf("OnConfigurationChange failed: %v", err)
+		}
+		if p.provider != nil {
+			t.Error("expected provider to be nil when client secret is missing")
+		}
+	})
+
+	t.Run("stale_provider_cleared_when_credentials_removed", func(t *testing.T) {
+		idp := newTestIDP(t)
+		mock := newMockAPI()
+		mock.loadedConfig = &pluginConfig{
+			IssuerURL:    idp.URL,
+			ClientID:     "test-client",
+			ClientSecret: "test-secret",
+		}
+		p := &Plugin{api: mock}
+		if err := p.OnConfigurationChange(); err != nil {
+			t.Fatalf("first OnConfigurationChange failed: %v", err)
+		}
+		if p.provider == nil {
+			t.Fatal("expected provider to be initialized for a valid issuer")
+		}
+
+		// The admin removes the client secret
+		mock.loadedConfig = &pluginConfig{
+			IssuerURL: idp.URL,
+			ClientID:  "test-client",
+		}
+		if err := p.OnConfigurationChange(); err != nil {
+			t.Fatalf("second OnConfigurationChange failed: %v", err)
+		}
+		if p.provider != nil {
+			t.Error("expected stale provider to be cleared when credentials are removed")
+		}
+		if p.verifier != nil {
+			t.Error("expected verifier to be cleared when credentials are removed")
 		}
 	})
 }

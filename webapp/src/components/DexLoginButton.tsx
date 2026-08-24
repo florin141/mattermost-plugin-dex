@@ -71,7 +71,7 @@ const DexLoginButton: React.FC = () => {
         const fetchConfig = async () => {
             try {
                 // Fetch public config from the plugin's server endpoint
-                const response = await fetch('/plugins/com.example.dex-sso/api/public-config');
+                const response = await fetch('/plugins/com.mattermost.dex/api/public-config');
                 if (!response.ok) {
                     // Fall back to defaults silently
                     setButtonColor('#009EDB');
@@ -94,28 +94,11 @@ const DexLoginButton: React.FC = () => {
     }, []);
 
     const handleLogin = () => {
-        if (!config?.issuerUrl || !config?.clientId) {
-            return;
-        }
-
-        // Build the Dex authorization URL
-        const params = new URLSearchParams({
-            response_type: 'code',
-            client_id: config.clientId,
-            redirect_uri: config.redirectUrl || window.location.origin + '/plugins/com.example.dex-sso/callback',
-            scope: 'openid profile email',
-            state: generateState(),
-            audience: config.issuerUrl,
-        });
-
-        const authUrl = `${config.issuerUrl}/auth?${params.toString()}`;
-        window.location.href = authUrl;
-    };
-
-    const generateState = (): string => {
-        const array = new Uint8Array(32);
-        crypto.getRandomValues(array);
-        return Array.from(array, (b) => b.toString(16).padStart(2, '0')).join('');
+        // Full-page navigation to the plugin's /login route, which generates
+        // the OAuth state, sets the state cookie, and redirects to the IdP.
+        // Never construct the authorization URL client-side: the server owns
+        // the OAuth exchange and the state/cookie lifecycle.
+        window.location.href = '/plugins/com.mattermost.dex/login';
     };
 
     if (loading || !config) {

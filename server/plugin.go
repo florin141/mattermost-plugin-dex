@@ -193,6 +193,18 @@ func (p *Plugin) isHTTPS() bool {
 	return *cfg.ServiceSettings.ConnectionSecurity != "http"
 }
 
+// sessionMaxAge returns the session-cookie lifetime in seconds, mirroring the
+// server's configured web session length so a plugin login behaves like a
+// native one. Falls back to sessionTTL when the value is unset.
+func (p *Plugin) sessionMaxAge() int {
+	if cfg := p.api.GetConfig(); cfg != nil &&
+		cfg.ServiceSettings.SessionLengthWebInHours != nil &&
+		*cfg.ServiceSettings.SessionLengthWebInHours > 0 {
+		return *cfg.ServiceSettings.SessionLengthWebInHours * 3600
+	}
+	return int(sessionTTL / time.Second)
+}
+
 // ServeHTTP handles HTTP requests for the plugin's API endpoints.
 func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -368,15 +380,15 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create the session the same way Mattermost's built-in OAuth providers
-	// do: only UserId and IsOAuth. Do NOT set Roles or any time fields -
-	// model.Session times are Unix *milliseconds*, while time.Now().Unix()
-	// returns *seconds*, so a second-based ExpiresAt looks expired at
-	// creation and the first request after login bounces to /login with 401.
-	// The server fills in Roles, CreateAt, LastActivityAt and ExpiresAt.
+	// do: only UserId and IsOAuth. The server owns the time fields (Unix
+	// milliseconds) and the token - leave them unset. Generate a CSRF token up
+	// front so it is persisted with the session; MM compares it against the
+	// MMCSRF cookie on state-changing requests.
 	session := &model.Session{
 		UserId:  user.Id,
 		IsOAuth: true,
 	}
+	csrfToken := session.GenerateCSRF()
 
 	createdSession, appErr := p.api.CreateSession(session)
 	if appErr != nil {
@@ -385,18 +397,43 @@ func (p *Plugin) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set the authentication cookie
-	cookie := &http.Cookie{
+	// Mirror MM's AttachSessionCookies: set all three session cookies. The
+	// webapp reads MMUSERID and MMCSRF from document.cookie to decide whether
+	// the user is logged in, so setting only MMAUTHTOKEN leaves the browser on
+	// /login even though the API accepts the session. Only MMAUTHTOKEN is
+	// HttpOnly.
+	maxAge := p.sessionMaxAge()
+	expires := time.Now().Add(time.Duration(maxAge) * time.Second)
+	secure := p.isHTTPS()
+
+	http.SetCookie(w, &http.Cookie{
 		Name:     cookieSessionTokenKey,
 		Value:    createdSession.Token,
 		Path:     "/",
-		Domain:   "",
-		Expires:  time.Now().Add(sessionTTL),
+		MaxAge:   maxAge,
+		Expires:  expires,
 		HttpOnly: true,
-		Secure:   p.isHTTPS(),
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
-	}
-	http.SetCookie(w, cookie)
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     model.SessionCookieUser,
+		Value:    user.Id,
+		Path:     "/",
+		MaxAge:   maxAge,
+		Expires:  expires,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     model.SessionCookieCsrf,
+		Value:    csrfToken,
+		Path:     "/",
+		MaxAge:   maxAge,
+		Expires:  expires,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
 
 	// Redirect to the home page
 	http.Redirect(w, r, "/", http.StatusFound)

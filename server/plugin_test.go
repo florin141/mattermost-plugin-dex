@@ -930,6 +930,41 @@ func TestHandleCallback(t *testing.T) {
 			t.Error("MMAUTHTOKEN cookie should be HttpOnly")
 		}
 
+		// Verify the companion session cookies the webapp relies on to render a
+		// logged-in UI (MMUSERID + MMCSRF). Omitting them leaves the browser on
+		// /login even though the API accepts the session. Both must NOT be
+		// HttpOnly, since the webapp reads them from document.cookie.
+		var userCookie, csrfCookie *http.Cookie
+		for _, c := range cookies {
+			switch c.Name {
+			case model.SessionCookieUser:
+				userCookie = c
+			case model.SessionCookieCsrf:
+				csrfCookie = c
+			}
+		}
+		if userCookie == nil {
+			t.Fatal("expected MMUSERID cookie to be set")
+		}
+		if userCookie.Value != mock.createdSession.UserId {
+			t.Errorf("MMUSERID value = %q, want %q", userCookie.Value, mock.createdSession.UserId)
+		}
+		if userCookie.HttpOnly {
+			t.Error("MMUSERID cookie should NOT be HttpOnly (webapp reads it)")
+		}
+		if csrfCookie == nil {
+			t.Fatal("expected MMCSRF cookie to be set")
+		}
+		if csrfCookie.Value == "" {
+			t.Error("MMCSRF value should be non-empty")
+		}
+		if csrfCookie.Value != mock.createdSession.GetCSRF() {
+			t.Errorf("MMCSRF value = %q, want %q", csrfCookie.Value, mock.createdSession.GetCSRF())
+		}
+		if csrfCookie.HttpOnly {
+			t.Error("MMCSRF cookie should NOT be HttpOnly (webapp reads it)")
+		}
+
 		// Verify the state cookie was cleared after a successful callback
 		var clearedState *http.Cookie
 		for _, c := range cookies {
@@ -1043,17 +1078,21 @@ func TestHandleCallback(t *testing.T) {
 			t.Fatalf("expected redirect to /, got %q", loc)
 		}
 
-		var authCookie *http.Cookie
-		for _, c := range w.Result().Cookies() {
-			if c.Name == cookieSessionTokenKey {
-				authCookie = c
+		cookies := w.Result().Cookies()
+		for _, name := range []string{cookieSessionTokenKey, model.SessionCookieUser, model.SessionCookieCsrf} {
+			var c *http.Cookie
+			for _, cc := range cookies {
+				if cc.Name == name {
+					c = cc
+				}
 			}
-		}
-		if authCookie == nil {
-			t.Fatal("expected MMAUTHTOKEN cookie to be set")
-		}
-		if authCookie.Secure {
-			t.Error("MMAUTHTOKEN cookie should not be Secure on plain HTTP")
+			if c == nil {
+				t.Errorf("expected %s cookie to be set", name)
+				continue
+			}
+			if c.Secure {
+				t.Errorf("%s cookie should not be Secure on plain HTTP", name)
+			}
 		}
 	})
 
